@@ -1,0 +1,30 @@
+# 雨课堂刷课助手（长江大学新版适配版）
+
+## 来源标注
+
+- **原项目**：[Niuwh/yuketang-jiaoben](https://github.com/Niuwh/yuketang-jiaoben)
+- **原作者**：风之子（niuwh）
+- **协议**：GPL3（本项目继承原协议）
+- **基础版本**：v3.0.6（2026-09-02，`新增独立的ai-workspace页面刷课逻辑`）
+- **本适配版**：v3.0.7-local
+- **适配日期**：2026-10-13
+- **适配目的**：长江大学（changjiang.yuketang.cn）雨课堂新版界面在 `/v2/web/studentLog/` 路径下已全面更换 DOM，原 V2Runner 的 `.logs-list` 选择器失效导致"未找到课程列表"死循环，故针对新版"未完成"待办列表做本地适配。
+
+## 适配内容
+
+1. **新增 UnfinishedRunner**：支持新版"未完成"待办列表页（`ul.unfinished-study__list > li.unfinished-study__item`），按 `data-title-key` 追踪项目，点击 `.unfinished-study__arrow` 逐项进入。
+2. **修复 AiWorkspaceRunner.returnToSource**：新版界面点击"去完成"为**同标签页跳转**到 `/ai-workspace/lms-graph/...`，原代码中同页回跳逻辑被注释，导致视频播完后停留在学习空间页面；现已恢复自动回跳课程目录页。
+3. **跳过清单与防死循环守卫**：考试项、未开启 AI 答题的作业项自动跳过（记录于 `ykt_skipped_keys`）；同一项点击后完成状态未更新时自动停止并警告（`ykt_last_key`），避免无限重试。
+4. **路由分流**：`/v2/web/` 页面存在旧版 `.logs-list` 时仍走原 V2Runner，新版待办列表走 UnfinishedRunner，兼容其他仍使用旧版界面的学校。
+
+## 使用方法
+
+1. 安装 Tampermonkey 浏览器扩展，导入本仓库 `yuketang.js`（或新建脚本粘贴全文）。
+2. 打开雨课堂课程目录页的**"未完成"**标签（`/v2/web/studentLog/<classroom_id>`）。
+3. 点击面板左上角悬浮窗的**"开始刷课"**，脚本自动逐项刷视频/音频；完成后自动回跳目录页继续下一项，直至全部刷完。
+4. AI 自动答题需在面板"AI 配置"中填入 API Key 并勾选"用 AI 自动作答"；未开启时作业项自动跳过。
+5. **停止刷课**可随时中断；**清除缓存**会重置进度与跳过记录。
+
+## 免责声明
+
+本项目为开源用户脚本，仅供学习、交流、参考、使用，遵循原项目 GPL3 协议。使用本项目对平台条款、学业诚信等造成的一切后果由使用者自行承担。如无意冒犯著作权，请联系删除。
