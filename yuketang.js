@@ -28,7 +28,7 @@
 //  来源：原项目 Niuwh/yuketang-jiaoben（作者：风之子，GPL3）
 //        https://github.com/Niuwh/yuketang-jiaoben
 //  基础版本：v3.0.6（2026-09-02）
-//  本地适配：v3.0.7-local（适配日期：2026-10-13）
+//  本地适配：v3.0.7-local（适配日期：2026-10-13，更新于 2026-10-13）
 //  适配内容：
 //    1. 新增 UnfinishedRunner：支持长江大学等新版"未完成"
 //       待办列表页（/v2/web/studentLog/*，DOM 为
@@ -39,6 +39,11 @@
 //       守卫（ykt_skipped_keys / ykt_last_key）
 //    4. /v2/web 路由分流：旧版 .logs-list 走 V2Runner，
 //       新版待办列表走 UnfinishedRunner，兼容其他学校旧版
+//    5. 修复"进度条满了但完成度只有 88%"问题：服务端按观看
+//       区间并集记账，2 倍速片段会被拒收形成缺口。新增
+//       WatchCredit 模块读取 /video-log/detail/ 明细，播放结束
+//       后用 1 倍速补齐缺口区间直至完成度 100%；无法读取明细
+//       时退化为等待页面完成度刷新或整体 1 倍速重播
 // ============================================================
 
 (() => {
@@ -1115,6 +1120,78 @@
     }
   };
 
+  // ---- 平台完成度核对 ----
+  // 雨课堂服务端按"观看区间并集"记账：2 倍速等过速片段可能被拒收，
+  // 导致播放器进度条走完但完成度停在 88% 之类的缺口。需用 1 倍速补播缺口区间。
+  const WatchCredit = {
+    watchParams: null, // 从页面自身请求里捕获的 { cid, userId }
+    installed: false,
+    install() {
+      if (this.installed) return;
+      this.installed = true;
+      const origOpen = XMLHttpRequest.prototype.open;
+      const self = this;
+      XMLHttpRequest.prototype.open = function (method, url) {
+        try {
+          const u = String(url || '');
+          if (u.includes('/video-log/') && !self.watchParams) {
+            const q = new URLSearchParams(u.split('?')[1] || '');
+            const cid = q.get('cid');
+            const userId = q.get('user_id');
+            if (cid && userId) {
+              self.watchParams = { cid, userId };
+              console.log('[WatchCredit] 已捕获观看参数', self.watchParams);
+            }
+          }
+        } catch (_) { }
+        return origOpen.apply(this, arguments);
+      };
+    },
+    getCookie(name) {
+      const match = document.cookie.match(new RegExp('(?:^|;\\s*)' + name + '=([^;]*)'));
+      return match ? decodeURIComponent(match[1]) : '';
+    },
+    // 读取服务端观看明细：{ result:[{s,e}], video_length, rate, completed }
+    async fetchDetail(route) {
+      if (!this.watchParams) return null;
+      try {
+        const url = `/video-log/detail/?cid=${this.watchParams.cid}&user_id=${this.watchParams.userId}&classroom_id=${route.classroomId}&video_id=${route.leafId}`;
+        const res = await fetch(url, {
+          credentials: 'include',
+          headers: { 'XTBZ': this.getCookie('xtbz') }
+        });
+        const json = await res.json();
+        if (!json.success) return null;
+        return json.data?.heartbeat || null;
+      } catch (e) {
+        console.error('[WatchCredit] 获取观看明细失败', e);
+        return null;
+      }
+    },
+    // 合并重叠区间，返回未被服务端认可的缺口 [{s,e}]
+    gaps(intervals, videoLength) {
+      const sorted = (intervals || [])
+        .map(iv => ({ s: Number(iv.s), e: Number(iv.e) }))
+        .filter(iv => Number.isFinite(iv.s) && Number.isFinite(iv.e) && iv.e > iv.s)
+        .sort((a, b) => a.s - b.s);
+      const merged = [];
+      for (const iv of sorted) {
+        const last = merged[merged.length - 1];
+        if (last && iv.s <= last.e + 1) last.e = Math.max(last.e, iv.e);
+        else merged.push({ ...iv });
+      }
+      const result = [];
+      let cursor = 0;
+      for (const iv of merged) {
+        if (iv.s > cursor + 1) result.push({ s: cursor, e: Math.min(iv.s, videoLength) });
+        cursor = Math.max(cursor, iv.e);
+        if (cursor >= videoLength - 1) break;
+      }
+      if (cursor < videoLength - 1) result.push({ s: cursor, e: videoLength });
+      return result;
+    }
+  };
+
   // ---- 防切屏 ----
   function preventScreenCheck() {
     const win = unsafeWindow;
@@ -2140,8 +2217,91 @@ ${ocrText}
         stopKeepAlive();
       }
 
+      // 主播放结束后核对服务端完成度：2 倍速片段可能被拒收形成缺口，需 1 倍速补齐
+      if (AiWorkspace.getMedia()?.tagName?.toLowerCase() === 'video') {
+        await this.ensureFullCredit(route);
+      }
+
       this.panel.log(`${title} 播放完成`);
       return true;
+    }
+
+    // 以 1 倍速补播 [s, e] 区间（服务端只认可不超过常规倍速的观看片段）
+    async playRange(s, e) {
+      const media = AiWorkspace.getMedia();
+      if (!media) return false;
+      this.panel.log(`补齐服务端未认可片段 ${Math.round(s)}s~${Math.round(e)}s（1 倍速）`);
+      media.currentTime = Math.max(0, s - 2);
+      media.playbackRate = 1;
+      media.muted = true;
+      media.volume = 0;
+      const stopObserve = Player.observePause(media);
+      const ok = await Utils.poll(() => {
+        const m = AiWorkspace.getMedia() || media;
+        return m.ended || Number(m.currentTime || 0) >= e;
+      }, { interval: 500, timeout: Math.max((e - s) * 3, 20000) });
+      stopObserve();
+      if (!ok) this.panel.warn(`补齐片段 ${Math.round(s)}s~${Math.round(e)}s 超时`);
+      return ok;
+    }
+
+    // 兜底：整体 1 倍速重播一遍，保证服务端区间覆盖完整视频
+    async replayFullOnce() {
+      const media = AiWorkspace.getMedia();
+      if (!media) return false;
+      const duration = Number(media.duration || 0);
+      media.currentTime = 0;
+      media.playbackRate = 1;
+      media.muted = true;
+      media.volume = 0;
+      const stopObserve = Player.observePause(media);
+      const ok = await Utils.poll(() => {
+        const m = AiWorkspace.getMedia() || media;
+        return m.ended || Player.isNearEnd(m, 2);
+      }, { interval: 1000, timeout: Math.max(duration * 2.5, 60000) });
+      stopObserve();
+      return ok;
+    }
+
+    // 播放结束后核对服务端完成度：2 倍速片段可能被拒收形成缺口，需 1 倍速补齐至 100%
+    async ensureFullCredit(route) {
+      let detail = await WatchCredit.fetchDetail(route);
+      if (!detail) {
+        this.panel.log('无法读取服务端观看明细，等待页面完成度刷新...');
+        const ok = await Utils.poll(() => {
+          const text = document.querySelector('.rate-detail')?.innerText || '';
+          return /已完成|100%/.test(text);
+        }, { interval: 2000, timeout: 30000 });
+        if (ok) {
+          this.panel.log('页面完成度已更新为已完成');
+          return true;
+        }
+        this.panel.warn('页面完成度未达 100%，将整体 1 倍速重播一遍');
+        return this.replayFullOnce();
+      }
+      if (detail.completed === 1 || Number(detail.rate) >= 0.999) {
+        this.panel.log('服务端完成度 100%，无需补齐');
+        return true;
+      }
+      for (let round = 0; round < 3; round++) {
+        const gaps = WatchCredit.gaps(detail.result, Number(detail.video_length));
+        if (!gaps.length) return true;
+        this.panel.log(`检测到 ${gaps.length} 段未认可区间，开始补齐（第 ${round + 1} 轮）`);
+        for (const gap of gaps) {
+          await this.playRange(gap.s, gap.e);
+          detail = await WatchCredit.fetchDetail(route);
+          if (!detail) {
+            this.panel.warn('服务端明细不可用，将整体 1 倍速重播一遍');
+            return this.replayFullOnce();
+          }
+          if (detail.completed === 1 || Number(detail.rate) >= 0.999) {
+            this.panel.log('服务端完成度已补齐至 100%');
+            return true;
+          }
+        }
+      }
+      this.panel.warn('补齐缺口后完成度仍未到 100%，将整体 1 倍速重播一遍');
+      return this.replayFullOnce();
     }
 
     async solveExerciseQuestion(root, label = '') {
@@ -2347,31 +2507,32 @@ ${ocrText}
         this.panel.resetStartButton('开始刷课');
         return;
       }
-      const skipped = Store.getSkippedKeys(this.baseUrl);
       const lastKey = Store.getLastKey(this.baseUrl);
+      const skippedSet = new Set(Store.getSkippedKeys(this.baseUrl));
       const featureFlags = Store.getFeatureConf();
       const isSkipType = it => it.type === '考试' || (it.type === '作业' && !featureFlags.autoAI);
       const items = this.getItems();
-      const pending = items.filter(it => !this.isDone(it.status) && !skipped.includes(it.key));
-      if (!pending.length) {
-        this.finish();
-        return;
-      }
-      let target = pending[0];
-      while (target && isSkipType(target)) {
-        Store.addSkippedKey(this.baseUrl, target.key);
-        this.panel.log(`已跳过：${target.title}（${target.type}${target.type === '作业' ? '，未开启AI答题' : ''}）`);
-        target = pending.find(it => !skipped.includes(it.key) && !isSkipType(it));
-      }
+      const pending = it => !this.isDone(it.status) && !skippedSet.has(it.key);
+      // 优先处理非跳过类型且与上一轮不同的项
+      let target = items.find(it => pending(it) && !isSkipType(it) && it.key !== lastKey);
+      if (!target) target = items.find(it => pending(it) && !isSkipType(it) && it.key === lastKey);
+      if (!target) target = items.find(it => pending(it) && it.key !== lastKey);
+      if (!target) target = items.find(it => pending(it));
       if (!target) {
         this.finish();
         return;
       }
+      if (isSkipType(target)) {
+        Store.addSkippedKey(this.baseUrl, target.key);
+        this.panel.log(`已跳过：${target.title}（${target.type}${target.type === '作业' ? '，未开启AI答题' : ''}）`);
+        return this.run();
+      }
       if (target.key && target.key === lastKey) {
-        this.panel.warn(`《${target.title}》上一轮点击后完成状态未更新，已自动停止，请手动检查该项`);
-        this.panel.resetStartButton('开始刷课');
-        Store.clearPendingAutoStart();
-        return;
+        // 补播后完成状态仍未更新：跳过该项避免死循环，继续处理下一项
+        Store.addSkippedKey(this.baseUrl, target.key);
+        Store.clearLastKey(this.baseUrl);
+        this.panel.warn(`《${target.title}》上一轮点击后完成状态未更新，本次已自动跳过，请手动检查该项`);
+        return this.run();
       }
       Store.setLastKey(this.baseUrl, target.key);
       this.panel.log(`点击进入：${target.title}（${target.type}，当前状态 ${target.status}）`);
@@ -2381,6 +2542,7 @@ ${ocrText}
 
   // ---- 路由 ----
   function start() {
+    WatchCredit.install();
     // ---- ai-workspace获取课程根目录信息并保存（处理完一个课程重定向到根目录） ----
     const classroomId = Utils.getCurrentClassroomId();
     const returnUrl = Utils.returnUrl()
