@@ -28,7 +28,7 @@
 //  来源：原项目 Niuwh/yuketang-jiaoben（作者：风之子，GPL3）
 //        https://github.com/Niuwh/yuketang-jiaoben
 //  基础版本：v3.0.6（2026-09-02）
-//  本地适配：v3.0.7-local（适配日期：2026-10-13，更新于 2026-10-13）
+//  本地适配：v3.0.7-local（适配日期：2026-10-13，更新于 2026-10-14）
 //  适配内容：
 //    1. 新增 UnfinishedRunner：支持长江大学等新版"未完成"
 //       待办列表页（/v2/web/studentLog/*，DOM 为
@@ -44,6 +44,14 @@
 //       WatchCredit 模块读取 /video-log/detail/ 明细，播放结束
 //       后用 1 倍速补齐缺口区间直至完成度 100%；无法读取明细
 //       时退化为等待页面完成度刷新或整体 1 倍速重播
+//    6. 新增播放前缺口预补齐：视频播放前先读取服务端明细，
+//       只补缺口区间、不重播已认可区间；已达标视频直接跳过，
+//       大幅缩短半截视频（如 2 倍速只记一半）的重刷时长。
+//       实测：新播放器页面会强制将倍速重置回 1x，缺口补齐
+//       只能以 1 倍速进行；服务端完成度约 97.25% 即判定完成
+//    7. AI 答题改为 DOM 文本优先：直接提取题干与选项文本
+//       （按 DOM 顺序映射 A/B/C/D），不再依赖截图 OCR；
+//       OCR 仅作为 DOM 提取失败时的兜底，消除识别错字 bug
 // ============================================================
 
 (() => {
@@ -1215,6 +1223,55 @@
 
   // ---- OCR & AI ----
   const Solver = {
+    // 定位选项列表容器（与 autoSelectAndSubmit 的查找顺序一致）
+    findOptionContainer(element) {
+      if (!element) return null;
+      return element.querySelector('.list-inline.list-unstyled-radio') ||
+        element.querySelector('.list-unstyled.list-unstyled-radio') ||
+        element.querySelector('.list-unstyled') ||
+        element.querySelector('ul.list') ||
+        element.querySelector('[class*="option-list"]') ||
+        element.querySelector('[class*="answer-list"]') ||
+        element.querySelector('ul') ||
+        element.querySelector('[role="radiogroup"]') ||
+        null;
+    },
+    // 直接从 DOM 提取结构化题目文本：题干 + 选项（按 DOM 顺序映射 A/B/C/D）
+    // 优先于 OCR 使用，避免截图识别带来的错字/漏字 bug；失败时调用方回退 OCR
+    async extractQuestion(element) {
+      if (!element) return null;
+      try {
+        const clone = element.cloneNode(true);
+        const optSelectors = [
+          '.list-inline.list-unstyled-radio',
+          '.list-unstyled.list-unstyled-radio',
+          '[class*="option-list"]',
+          '[class*="answer-list"]',
+          '[role="radiogroup"]',
+          'ul.list'
+        ];
+        for (const sel of optSelectors) {
+          clone.querySelectorAll(sel).forEach(n => n.remove());
+        }
+        const stem = (clone.innerText || '').replace(/\s+/g, ' ').trim();
+        if (stem.length <= 5) return null;
+        const listContainer = this.findOptionContainer(element);
+        const options = [];
+        if (listContainer) {
+          const items = listContainer.querySelectorAll('li, .option-item, .answer-item, [class*="option-item"], [class*="answer-item"]');
+          const letters = 'ABCDEFGHIJ';
+          Array.from(items).forEach((it, idx) => {
+            let t = (it.innerText || '').replace(/\s+/g, ' ').trim();
+            t = t.replace(/^[A-Ja-j][.、．:：)）]\s*/, '');
+            if (t.length > 1) options.push(`${letters[idx] || String(idx)}. ${t}`);
+          });
+        }
+        return { stem, options, text: [stem, ...options].join('\n') };
+      } catch (err) {
+        console.error('[Solver] DOM 题目提取失败', err);
+        return null;
+      }
+    },
     async recognize(element) {
       if (!element) return '无元素';
       try {
@@ -1240,7 +1297,7 @@
         return 'OCR识别出错';
       }
     },
-    async askAI(ocrText, optionCount = 0) {
+    async askAI(questionText, optionCount = 0) {
       const saved = Store.getAIConf();
       const API_URL = saved.url;
       const API_KEY = saved.key;
@@ -1257,13 +1314,13 @@
         const maxChar = String.fromCharCode(65 + optionCount - 1);
         const rangeStr = optionCount ? `A-${maxChar}` : 'A-D';
         const prompt = `
-你是专业做题助手，请分析 OCR 文本，判断题型后给出答案。
+你是专业做题助手，请阅读题目与选项文本，判断题型后给出答案。
 强约束：
 1) 本题只有 ${optionCount || '若干'} 个选项，范围 ${rangeStr}
-2) 忽略 OCR 错误的选项字母，按出现顺序映射 A/B/C/D...
+2) 选项文本已按出现顺序标记为 A/B/C/D...，直接引用对应字母
 3) 输出格式必须包含“正确答案：”前缀，例如 正确答案：A 或 正确答案：ABD 或 正确答案：对/错
 题目内容：
-${ocrText}
+${questionText}
 `;
         const systemPrompt = "你是一个只输出答案的助手。判断题输出'对'或'错'，选择题输出字母。";
 
@@ -1767,7 +1824,7 @@ ${ocrText}
         this.updateProgress(this.outside, idx);
         return idx;
       }
-      this.panel.log('进入作业，启动 OCR + AI');
+      this.panel.log('进入作业，启动 AI 答题');
       item.click();
       await Utils.sleep(1500);
       let i = 0;
@@ -1794,8 +1851,19 @@ ${ocrText}
           targetEl?.querySelector('.list-unstyled.list-unstyled-radio') ||
           targetEl?.querySelector('ul.list');
         if (listContainer) optionCount = listContainer.querySelectorAll('li').length;
-        const ocrResult = await Solver.recognize(targetEl);
-        if (ocrResult && ocrResult.length > 5) {
+        let questionText = await Solver.extractQuestion(targetEl);
+        if (!questionText || questionText.text.length <= 5) {
+          this.panel.log(`第 ${i + 1} 题 DOM 提取失败，回退 OCR 识别...`);
+          const fallback = await Solver.recognize(targetEl);
+          if (!fallback || fallback.length <= 5) {
+            this.panel.log(`第 ${i + 1} 题 OCR 结果过短，跳过`);
+            await Utils.sleep(1500);
+            i++;
+            continue;
+          }
+          questionText = { text: fallback };
+        }
+        if (questionText && questionText.text.length > 5) {
           let retryCount = 0;
           let success = false;
           while (retryCount < maxRetry && !success) {
@@ -1804,7 +1872,7 @@ ${ocrText}
                 this.panel.log(`🔄 第 ${i + 1} 题重试 ${retryCount}/${maxRetry}...`);
               }
               panel.log('🤖 请求 AI 获取答案...');
-              const aiText = await Solver.askAI(ocrResult, optionCount);
+              const aiText = await Solver.askAI(questionText.text, optionCount);
               await Solver.autoSelectAndSubmit(aiText, targetEl);
               success = true;
             } catch (err) {
@@ -2157,6 +2225,15 @@ ${ocrText}
         return false;
       }
 
+      // 播放前先核对服务端观看明细：已有记录的视频只补缺口，已达标直接跳过整段重播
+      if (media.tagName.toLowerCase() === 'video') {
+        const prefilled = await this.prefillGaps(route);
+        if (prefilled) {
+          this.panel.log(`${title} 服务端已完成，跳过播放`);
+          return true;
+        }
+      }
+
       const playbackState = { completed: false };
       const shouldResume = () => !playbackState.completed;
       let stopObserve = () => { };
@@ -2224,6 +2301,32 @@ ${ocrText}
 
       this.panel.log(`${title} 播放完成`);
       return true;
+    }
+
+    // 播放前预补齐：只补服务端未认可的缺口区间，不重播已认可区间。
+    // 返回 true 表示服务端已完成（或补齐后完成），调用方应跳过正常播放。
+    async prefillGaps(route) {
+      if (!WatchCredit.watchParams) {
+        // 页面自身 /video-log/ 请求可能尚未发出，短暂等待捕获 cid/user_id
+        await Utils.poll(() => Boolean(WatchCredit.watchParams), { interval: 500, timeout: 8000 });
+      }
+      if (!WatchCredit.watchParams) return false;
+      let detail = await WatchCredit.fetchDetail(route);
+      if (!detail || !Array.isArray(detail.result) || !detail.result.length) return false;
+      if (detail.completed === 1) return true;
+      const gaps = WatchCredit.gaps(detail.result, Number(detail.video_length));
+      if (!gaps.length) return false;
+      this.panel.log(`检测到 ${gaps.length} 段未认可区间，播放前直接补齐`);
+      for (const gap of gaps) {
+        await this.playRange(gap.s, gap.e);
+        detail = await WatchCredit.fetchDetail(route);
+        if (!detail) return false;
+        if (detail.completed === 1) {
+          this.panel.log('缺口补齐完毕，服务端已判定完成');
+          return true;
+        }
+      }
+      return false;
     }
 
     // 以 1 倍速补播 [s, e] 区间（服务端只认可不超过常规倍速的观看片段）
@@ -2331,10 +2434,15 @@ ${ocrText}
         return false;
       }
 
-      const ocrResult = await Solver.recognize(questionRoot);
-      if (!ocrResult || ocrResult.length <= 5) {
-        this.panel.log(`${label || '当前题目'} OCR 结果过短，跳过`);
-        return false;
+      let questionText = await Solver.extractQuestion(questionRoot);
+      if (!questionText || questionText.text.length <= 5) {
+        this.panel.log(`${label || '当前题目'} DOM 提取失败，回退 OCR 识别...`);
+        const fallback = await Solver.recognize(questionRoot);
+        if (!fallback || fallback.length <= 5) {
+          this.panel.log(`${label || '当前题目'} OCR 结果过短，跳过`);
+          return false;
+        }
+        questionText = { text: fallback };
       }
 
       const maxRetry = 3;
@@ -2342,7 +2450,7 @@ ${ocrText}
         try {
           if (retryCount > 0) this.panel.log(`${label || '当前题目'} 重试 ${retryCount}/${maxRetry - 1}`);
           this.panel.log('🤖 请求 AI 获取答案...');
-          const aiText = await Solver.askAI(ocrResult, optionCount);
+          const aiText = await Solver.askAI(questionText.text, optionCount);
           await Solver.autoSelectAndSubmit(aiText, questionRoot);
           await Utils.sleep(1200);
           return true;
